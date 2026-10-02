@@ -4,6 +4,7 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
+val qwenNdkVersion = "27.2.12479018"
 val qwenOpenmp = providers.gradleProperty("qwen.openmp")
     .map { it.equals("true", ignoreCase = true) }
     .orElse(false)
@@ -16,6 +17,7 @@ val qwenOpencl = providers.gradleProperty("qwen.opencl")
 val qwenOpenclSdkDir = providers.gradleProperty("qwen.opencl.sdkDir")
     .orElse(layout.projectDirectory.dir("../build/opencl-sdk").asFile.absolutePath)
 val qwenSpirvHeadersDir = providers.gradleProperty("qwen.spirvHeadersDir").orElse("")
+val qwenVulkanHeadersDir = providers.gradleProperty("qwen.vulkanHeadersDir").orElse("")
 val generatedOpenmpJniLibs = layout.buildDirectory.dir("generated/openmpJniLibs")
 
 val copyOpenmpLibs by tasks.registering {
@@ -27,7 +29,7 @@ val copyOpenmpLibs by tasks.registering {
     doLast {
         delete(generatedOpenmpJniLibs)
         if (qwenOpenmp.get()) {
-            val libomp = fileTree("${sdkDir.get()}/ndk") {
+            val libomp = fileTree("${sdkDir.get()}/ndk/$qwenNdkVersion") {
                 include("**/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/libomp.so")
             }.singleFile
             copy {
@@ -41,6 +43,7 @@ val copyOpenmpLibs by tasks.registering {
 android {
     namespace = "com.qwen.tts.android"
     compileSdk = 36
+    ndkVersion = qwenNdkVersion
 
     defaultConfig {
         applicationId = "com.qwen.tts.android"
@@ -94,6 +97,9 @@ android {
                 )
                 if (qwenSpirvHeadersDir.get().isNotBlank()) {
                     arguments += "-DSPIRV-Headers_DIR=${qwenSpirvHeadersDir.get()}"
+                }
+                if (qwenVulkanHeadersDir.get().isNotBlank()) {
+                    arguments += "-DQWEN3_ANDROID_VULKAN_HEADERS_DIR=${qwenVulkanHeadersDir.get()}"
                 }
             }
         }
