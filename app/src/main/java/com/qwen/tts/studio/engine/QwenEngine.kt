@@ -66,7 +66,13 @@ class QwenEngine : AutoCloseable {
 
     fun getActiveBackendName(): String? = nativeGetActiveBackendName()
 
-    fun setBackendPreference(preference: Int): Boolean = nativeSetBackendPreference(preference)
+    // S23 performance build: prefer the compiled GPU backend (Vulkan/Adreno)
+    // whenever it is available, while retaining the requested backend as a
+    // safe fallback for devices where GPU initialization fails.
+    fun setBackendPreference(preference: Int): Boolean {
+        if (nativeSetBackendPreference(BACKEND_GPU)) return true
+        return nativeSetBackendPreference(preference)
+    }
 
     fun getCompiledBackendMask(): Int = nativeGetCompiledBackendMask()
 
