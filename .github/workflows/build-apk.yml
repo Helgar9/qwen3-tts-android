@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build S23 Performance APK
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Debug APK
+    name: Build S23 Performance Release APK
     runs-on: ubuntu-latest
 
     steps:
@@ -48,12 +48,23 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x ./gradlew
 
-      - name: Build Debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+      - name: Build S23 optimized release APK
+        run: |
+          ./gradlew :app:assembleRelease \
+            -Pqwen.vulkan=true \
+            -Pqwen.openmp=true \
+            --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk \
+            artifacts/qwen3-tts-s23-vulkan-openmp-release.apk
+          ls -lh artifacts
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: qwen3-tts-android-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: qwen3-tts-s23-performance
+          path: artifacts/qwen3-tts-s23-vulkan-openmp-release.apk
           if-no-files-found: error
