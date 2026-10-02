@@ -42,6 +42,11 @@ jobs:
             "ndk;27.2.12479018" \
             "cmake;3.22.1"
 
+      - name: Install Vulkan build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y spirv-headers
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
