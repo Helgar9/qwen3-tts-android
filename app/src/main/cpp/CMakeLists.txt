@@ -55,6 +55,23 @@ if (QWEN3_ANDROID_VULKAN AND DEFINED QWEN3_ANDROID_VULKAN_HEADERS_DIR)
     endif()
 endif()
 
+# SPIRV-Headers_DIR points at <prefix>/share/cmake/SPIRV-Headers. ggml-vulkan
+# also includes the headers directly while cross-compiling for Android, so expose
+# <prefix>/include to the target compiler before ggml is added.
+if (QWEN3_ANDROID_VULKAN AND DEFINED SPIRV-Headers_DIR)
+    get_filename_component(_qwen3_spirv_cmake_dir "${SPIRV-Headers_DIR}" ABSOLUTE)
+    get_filename_component(_qwen3_spirv_cmake_parent "${_qwen3_spirv_cmake_dir}" DIRECTORY)
+    get_filename_component(_qwen3_spirv_share_dir "${_qwen3_spirv_cmake_parent}" DIRECTORY)
+    get_filename_component(_qwen3_spirv_prefix "${_qwen3_spirv_share_dir}" DIRECTORY)
+    set(_qwen3_spirv_include "${_qwen3_spirv_prefix}/include")
+    if (EXISTS "${_qwen3_spirv_include}/spirv/unified1/spirv.hpp")
+        include_directories(SYSTEM "${_qwen3_spirv_include}")
+        message(STATUS "Using Android SPIR-V headers: ${_qwen3_spirv_include}")
+    else()
+        message(FATAL_ERROR "SPIR-V headers not found at ${_qwen3_spirv_include}")
+    endif()
+endif()
+
 add_subdirectory("${GGML_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
 find_package(Threads REQUIRED)
