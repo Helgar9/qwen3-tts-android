@@ -45,7 +45,20 @@ jobs:
       - name: Install Vulkan build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y spirv-headers
+          sudo apt-get install -y glslc libvulkan-dev git
+
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git "$RUNNER_TEMP/SPIRV-Headers"
+          cmake \
+            -S "$RUNNER_TEMP/SPIRV-Headers" \
+            -B "$RUNNER_TEMP/SPIRV-Headers-build" \
+            -DSPIRV_HEADERS_ENABLE_TESTS=OFF \
+            -DSPIRV_HEADERS_ENABLE_INSTALL=ON \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/spirv-install"
+          cmake --build "$RUNNER_TEMP/SPIRV-Headers-build"
+          cmake --install "$RUNNER_TEMP/SPIRV-Headers-build"
+
+          test -f "$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
+          ls -la "$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -58,6 +71,7 @@ jobs:
           ./gradlew :app:assembleRelease \
             -Pqwen.vulkan=true \
             -Pqwen.openmp=true \
+            -Pqwen.spirvHeadersDir="$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers" \
             --stacktrace
 
       - name: Collect APK
