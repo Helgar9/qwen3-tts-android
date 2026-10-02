@@ -4,9 +4,13 @@ class QwenEngine : AutoCloseable {
     private var nativePtr: Long = 0
 
     companion object {
+        // These values mirror qwen3_tts_c.h. Value 2 is specifically CUDA,
+        // not a generic GPU selector. Android performance builds use AUTO so
+        // GGML can choose Vulkan/Adreno first and safely fall back to CPU.
         const val BACKEND_AUTO: Int = 0
         const val BACKEND_CPU: Int = 1
-        const val BACKEND_GPU: Int = 2
+        const val BACKEND_CUDA: Int = 2
+        const val BACKEND_GPU: Int = BACKEND_AUTO
     }
 
     class NativeParams(
@@ -66,12 +70,14 @@ class QwenEngine : AutoCloseable {
 
     fun getActiveBackendName(): String? = nativeGetActiveBackendName()
 
-    // S23 performance build: prefer the compiled GPU backend (Vulkan/Adreno)
-    // whenever it is available, while retaining the requested backend as a
-    // safe fallback for devices where GPU initialization fails.
+    // This fork is the Galaxy S23 performance build. The upstream Android UI
+    // currently exposes only a legacy CPU choice, while the native C API's
+    // numeric "GPU" value actually means CUDA. Always request AUTO here:
+    // GGML then probes IGPU/GPU/ACCEL (Vulkan on Android) before CPU fallback.
     fun setBackendPreference(preference: Int): Boolean {
-        if (nativeSetBackendPreference(BACKEND_GPU)) return true
-        return nativeSetBackendPreference(preference)
+        @Suppress("UNUSED_VARIABLE")
+        val requestedByUi = preference
+        return nativeSetBackendPreference(BACKEND_AUTO)
     }
 
     fun getCompiledBackendMask(): Int = nativeGetCompiledBackendMask()

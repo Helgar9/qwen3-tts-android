@@ -1,6 +1,5 @@
 package com.qwen.tts.android
 
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -27,6 +26,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.qwen.tts.android.data.AudioImportConverter
 import com.qwen.tts.android.data.db.QwenDatabase
 import com.qwen.tts.android.data.db.VoiceProfileEntity
 import com.qwen.tts.android.ui.theme.QwenTtsTheme
@@ -39,8 +39,10 @@ import kotlinx.coroutines.withContext
 class ImportVoiceActivity : ComponentActivity() {
     private var voiceName by mutableStateOf("Estelle")
     private var selectedUri by mutableStateOf<Uri?>(null)
-    private var selectedLabel by mutableStateOf("No WAV selected")
-    private var status by mutableStateOf("Choose a saved WAV file from your phone.")
+    private var selectedLabel by mutableStateOf("No audio selected")
+    private var status by mutableStateOf(
+        "Choose WAV, FLAC, MP3, M4A/AAC, OGG/Vorbis, Opus or WebM audio from your phone.",
+    )
     private var busy by mutableStateOf(false)
 
     private val modelDir by lazy { File(filesDir, "qwen3-tts-models") }
@@ -55,10 +57,13 @@ class ImportVoiceActivity : ComponentActivity() {
                     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                         if (uri != null) {
                             selectedUri = uri
-                            selectedLabel = uri.lastPathSegment ?: "Selected WAV"
-                            status = "Ready to create a voice profile."
+                            selectedLabel = uri.lastPathSegment ?: "Selected audio"
+                            status = "Ready. The file will be converted to 24 kHz mono WAV for Qwen."
                             runCatching {
-                                contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                contentResolver.takePersistableUriPermission(
+                                    uri,
+                                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                                )
                             }
                         }
                     }
@@ -71,7 +76,10 @@ class ImportVoiceActivity : ComponentActivity() {
                     ) {
                         Spacer(Modifier.height(20.dp))
                         Text("Import saved voice", style = MaterialTheme.typography.headlineSmall)
-                        Text("Select an IrodoriTTS WAV stored on this Galaxy. It will be copied into the app and converted into a reusable Qwen speaker embedding.")
+                        Text(
+                            "Select a saved reference voice. Common formats are decoded on-device, " +
+                                "downmixed to mono and resampled to Qwen's 24 kHz reference format.",
+                        )
 
                         OutlinedTextField(
                             value = voiceName,
@@ -83,13 +91,17 @@ class ImportVoiceActivity : ComponentActivity() {
                         )
 
                         Button(
-                            onClick = { picker.launch(arrayOf("audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave")) },
+                            onClick = { picker.launch(arrayOf("audio/*")) },
                             enabled = !busy,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("Choose saved WAV")
+                            Text("Choose saved audio")
                         }
 
+                        Text(
+                            "WAV / FLAC / MP3 / M4A-AAC / OGG-Vorbis / Opus / WebM",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                         Text(selectedLabel, style = MaterialTheme.typography.bodySmall)
 
                         Button(
@@ -112,7 +124,7 @@ class ImportVoiceActivity : ComponentActivity() {
         val uri = selectedUri ?: return
         val requestedName = voiceName.trim().ifBlank { "Imported Voice" }
         busy = true
-        status = "Preparing WAV..."
+        status = "Reading selected audio..."
 
         lifecycleScope.launch {
             val result = runCatching {
@@ -125,85 +137,70 @@ class ImportVoiceActivity : ComponentActivity() {
 
                     val voiceId = "voice-${System.currentTimeMillis()}"
                     val targetDir = File(voiceDir, voiceId).apply { mkdirs() }
-                    val reference = File(targetDir, "reference.wav")
-
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        reference.outputStream().use { output -> input.copyTo(output) }
-                    } ?: error("Could not read the selected file")
-
-                    require(isPcmWav(reference)) {
-                        "The selected file is not a supported PCM WAV. Export the IrodoriTTS reference as WAV and try again."
-                    }
-
-                    status = "Loading Qwen model on the fastest available backend..."
-                    val engine = QwenEngine()
                     try {
-                        engine.setBackendPreference(QwenEngine.BACKEND_GPU)
-                        engine.setCpuThreads(Runtime.getRuntime().availableProcessors().coerceAtLeast(1))
-                        if (!engine.loadModels(modelDir.absolutePath, talker.name)) {
-                            error(engine.getLastError() ?: "Model load failed")
-                        }
+                        val source = File(targetDir, "source-audio")
+                        val reference = File(targetDir, "reference.wav")
 
-                        status = "Extracting speaker embedding..."
-                        val embedding = File(targetDir, "speaker.json")
-                        if (!engine.extractSpeakerEmbedding(reference.absolutePath, embedding.absolutePath)) {
-                            error(engine.getLastError() ?: "Speaker embedding extraction failed")
-                        }
+                        contentResolver.openInputStream(uri)?.use { input ->
+                            source.outputStream().use { output -> input.copyTo(output) }
+                        } ?: error("Could not read the selected file")
 
-                        val durationMillis = readDurationMillis(reference)
-                        val dao = QwenDatabase.getDatabase(applicationContext).qwenDao()
-                        dao.insertVoice(
-                            VoiceProfileEntity(
-                                voiceId = voiceId,
-                                name = requestedName,
-                                referenceWavPath = reference.absolutePath,
-                                speakerEmbeddingPath = embedding.absolutePath,
-                                durationMillis = durationMillis,
-                            ),
-                        )
-                    } finally {
-                        engine.close()
+                        status = "Decoding and converting audio to 24 kHz mono WAV..."
+                        val conversion = AudioImportConverter.convertToReferenceWav(source, reference)
+                        source.delete()
+
+                        status = "Loading Qwen model on Vulkan/accelerated backend..."
+                        val engine = QwenEngine()
+                        try {
+                            // AUTO probes Android accelerated backends first. In this S23 build
+                            // Vulkan is compiled in, while CUDA is intentionally never requested.
+                            engine.setBackendPreference(QwenEngine.BACKEND_AUTO)
+                            engine.setCpuThreads(Runtime.getRuntime().availableProcessors().coerceAtLeast(1))
+                            if (!engine.loadModels(modelDir.absolutePath, talker.name)) {
+                                error(engine.getLastError() ?: "Model load failed")
+                            }
+
+                            status = "Extracting speaker embedding..."
+                            val embedding = File(targetDir, "speaker.json")
+                            if (!engine.extractSpeakerEmbedding(reference.absolutePath, embedding.absolutePath)) {
+                                error(engine.getLastError() ?: "Speaker embedding extraction failed")
+                            }
+
+                            val dao = QwenDatabase.getDatabase(applicationContext).qwenDao()
+                            dao.insertVoice(
+                                VoiceProfileEntity(
+                                    voiceId = voiceId,
+                                    name = requestedName,
+                                    referenceWavPath = reference.absolutePath,
+                                    speakerEmbeddingPath = embedding.absolutePath,
+                                    durationMillis = conversion.durationMillis,
+                                ),
+                            )
+
+                            "$requestedName (${conversion.sourceMime}, ${conversion.sourceSampleRate} Hz → 24000 Hz mono)"
+                        } finally {
+                            engine.close()
+                        }
+                    } catch (error: Throwable) {
+                        targetDir.deleteRecursively()
+                        throw error
                     }
-
-                    requestedName
                 }
             }
 
             result.fold(
-                onSuccess = { name ->
+                onSuccess = { details ->
                     busy = false
-                    status = "Voice '$name' created. Open the main app and select it from Voices."
+                    status = "Voice created: $details. Open the main app and select it from Voices."
                     selectedUri = null
-                    selectedLabel = "No WAV selected"
+                    selectedLabel = "No audio selected"
                 },
                 onFailure = { error ->
                     busy = false
-                    status = error.message ?: "Voice import failed"
+                    status = (error.message ?: "Voice import failed") +
+                        "\nSupported on the S23: WAV, FLAC, MP3, AAC/M4A, OGG/Vorbis, Opus and WebM audio."
                 },
             )
         }
-    }
-
-    private fun isPcmWav(file: File): Boolean {
-        if (!file.isFile || file.length() < 44L) return false
-        val header = ByteArray(12)
-        file.inputStream().use { input ->
-            if (input.read(header) != header.size) return false
-        }
-        val riff = String(header, 0, 4, Charsets.US_ASCII)
-        val wave = String(header, 8, 4, Charsets.US_ASCII)
-        return riff == "RIFF" && wave == "WAVE"
-    }
-
-    private fun readDurationMillis(file: File): Long {
-        return runCatching {
-            val retriever = MediaMetadataRetriever()
-            try {
-                retriever.setDataSource(file.absolutePath)
-                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-            } finally {
-                retriever.release()
-            }
-        }.getOrDefault(0L)
     }
 }
