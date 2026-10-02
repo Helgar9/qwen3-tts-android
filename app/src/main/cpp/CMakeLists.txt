@@ -45,6 +45,16 @@ if (QWEN3_ANDROID_VULKAN AND CMAKE_HOST_WIN32)
         set(Vulkan_GLSLC_EXECUTABLE "${_qwen3_glslc}" CACHE FILEPATH "" FORCE)
     endif()
 endif()
+
+if (QWEN3_ANDROID_VULKAN AND DEFINED QWEN3_ANDROID_VULKAN_HEADERS_DIR)
+    if (EXISTS "${QWEN3_ANDROID_VULKAN_HEADERS_DIR}/vulkan/vulkan.hpp")
+        include_directories(SYSTEM "${QWEN3_ANDROID_VULKAN_HEADERS_DIR}")
+        message(STATUS "Using Android Vulkan C++ headers: ${QWEN3_ANDROID_VULKAN_HEADERS_DIR}")
+    else()
+        message(FATAL_ERROR "Vulkan C++ headers not found at ${QWEN3_ANDROID_VULKAN_HEADERS_DIR}")
+    endif()
+endif()
+
 add_subdirectory("${GGML_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
 find_package(Threads REQUIRED)
