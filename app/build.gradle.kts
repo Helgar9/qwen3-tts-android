@@ -15,6 +15,7 @@ val qwenOpencl = providers.gradleProperty("qwen.opencl")
     .orElse(false)
 val qwenOpenclSdkDir = providers.gradleProperty("qwen.opencl.sdkDir")
     .orElse(layout.projectDirectory.dir("../build/opencl-sdk").asFile.absolutePath)
+val qwenSpirvHeadersDir = providers.gradleProperty("qwen.spirvHeadersDir").orElse("")
 val generatedOpenmpJniLibs = layout.buildDirectory.dir("generated/openmpJniLibs")
 
 val copyOpenmpLibs by tasks.registering {
@@ -91,6 +92,9 @@ android {
                     "-DOpenCL_INCLUDE_DIR=${qwenOpenclSdkDir.get()}/OpenCL-Headers",
                     "-DOpenCL_LIBRARY=${qwenOpenclSdkDir.get()}/lib/arm64-v8a/libOpenCL.so",
                 )
+                if (qwenSpirvHeadersDir.get().isNotBlank()) {
+                    arguments += "-DSPIRV-Headers_DIR=${qwenSpirvHeadersDir.get()}"
+                }
             }
         }
     }
