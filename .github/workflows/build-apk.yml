@@ -58,7 +58,9 @@ jobs:
           cmake --install "$RUNNER_TEMP/SPIRV-Headers-build"
 
           test -f "$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
-          ls -la "$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers"
+
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/Vulkan-Headers"
+          test -f "$RUNNER_TEMP/Vulkan-Headers/include/vulkan/vulkan.hpp"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -72,6 +74,7 @@ jobs:
             -Pqwen.vulkan=true \
             -Pqwen.openmp=true \
             -Pqwen.spirvHeadersDir="$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers" \
+            -Pqwen.vulkanHeadersDir="$RUNNER_TEMP/Vulkan-Headers/include" \
             --stacktrace
 
       - name: Collect APK
