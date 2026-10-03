@@ -45,9 +45,9 @@ jobs:
       - name: Install host build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y git ninja-build patchelf
+          sudo apt-get install -y git ninja-build
 
-      - name: Build Android OpenCL loader
+      - name: Build OpenCL link-time SDK
         shell: bash
         run: |
           set -euxo pipefail
@@ -70,49 +70,27 @@ jobs:
             -DENABLE_OPENCL_LAYERS=OFF
           cmake --build "$RUNNER_TEMP/OpenCL-ICD-Loader-build"
 
-          LOADER="$(find "$RUNNER_TEMP/OpenCL-ICD-Loader-build" -name libOpenCL.so -type f | head -n 1)"
-          test -n "$LOADER"
+          LINK_LIB="$(find "$RUNNER_TEMP/OpenCL-ICD-Loader-build" -name libOpenCL.so -type f | head -n 1)"
+          test -n "$LINK_LIB"
 
-          mkdir -p "$SDK/OpenCL-Headers" "$SDK/lib/arm64-v8a" app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$SDK/OpenCL-Headers" "$SDK/lib/arm64-v8a"
           cp -R "$RUNNER_TEMP/OpenCL-Headers/CL" "$SDK/OpenCL-Headers/"
 
-          # Give the bundled ICD loader a unique SONAME. This lets it dynamically
-          # open Samsung/Qualcomm's real system libOpenCL.so instead of loading itself.
-          cp "$LOADER" "$SDK/lib/arm64-v8a/libOpenCL.so"
-          patchelf --set-soname libOpenCLLoader.so "$SDK/lib/arm64-v8a/libOpenCL.so"
-          cp "$SDK/lib/arm64-v8a/libOpenCL.so" app/src/main/jniLibs/arm64-v8a/libOpenCLLoader.so
+          # Link ggml-opencl against libOpenCL.so at build time only.
+          # Do NOT package this loader into the APK. On the Galaxy S23, Android
+          # resolves DT_NEEDED=libOpenCL.so to Samsung/Qualcomm's system driver,
+          # which is exposed by the app's <uses-native-library> manifest entry.
+          cp "$LINK_LIB" "$SDK/lib/arm64-v8a/libOpenCL.so"
 
-          readelf -d app/src/main/jniLibs/arm64-v8a/libOpenCLLoader.so | grep SONAME
-          ls -lh app/src/main/jniLibs/arm64-v8a "$SDK/lib/arm64-v8a"
+          readelf -d "$SDK/lib/arm64-v8a/libOpenCL.so" | grep SONAME || true
+          ls -lh "$SDK/lib/arm64-v8a"
 
-      - name: Configure OpenCL runtime discovery
+      - name: Configure OpenCL UI labels
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          # The Khronos loader supports OCL_ICD_FILENAMES. Set it before ggml's
-          # first OpenCL call so it can reach the Qualcomm/Samsung vendor driver.
-          jni = Path("external/qwen3-tts.cpp/src/qwen3_tts_jni.cpp")
-          text = jni.read_text(encoding="utf-8")
-          if "#include <cstdlib>" not in text:
-              text = text.replace("#include <cstring>\n", "#include <cstring>\n#include <cstdlib>\n", 1)
-          anchor = '''JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
-          '''
-          injection = '''JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
-              // Android vendor OpenCL driver discovery. The bundled ICD loader is
-              // named libOpenCLLoader.so, so libOpenCL.so resolves to the device driver.
-              setenv("OCL_ICD_FILENAMES",
-                     "libOpenCL.so:/vendor/lib64/libOpenCL.so:/system/vendor/lib64/libOpenCL.so",
-                     0);
-          '''
-          if anchor not in text:
-              raise SystemExit("JNI_OnLoad anchor not found")
-          text = text.replace(anchor, injection, 1)
-          jni.write_text(text, encoding="utf-8")
-
-          # This APK is OpenCL, not Vulkan. Keep the existing AUTO/CPU safety UI,
-          # but make its labels and diagnostics accurate for this build.
           ui = Path("app/src/main/java/com/qwen/tts/android/MainActivity.kt")
           text = ui.read_text(encoding="utf-8")
           replacements = {
@@ -144,9 +122,27 @@ jobs:
             -Pqwen.opencl.sdkDir="$RUNNER_TEMP/qwen-opencl-sdk" \
             --stacktrace
 
-      - name: Inspect packaged native libraries
+      - name: Verify OpenCL runtime linkage
+        shell: bash
         run: |
-          unzip -l app/build/outputs/apk/release/app-release.apk | grep -E 'lib/(arm64-v8a|arm64)/.*(OpenCL|qwen|ggml)' || true
+          set -euxo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+
+          # The APK must contain ggml-opencl but must NOT contain our build-time
+          # libOpenCL.so or the old libOpenCLLoader.so workaround.
+          unzip -l "$APK" | grep -E 'lib/(arm64-v8a|arm64)/.*(OpenCL|qwen|ggml)' || true
+          if unzip -l "$APK" | grep -qE 'lib/arm64-v8a/libOpenCL(Loader)?\.so'; then
+            echo "ERROR: build-time OpenCL loader was accidentally packaged"
+            exit 1
+          fi
+
+          unzip -p "$APK" lib/arm64-v8a/libggml-opencl.so > "$RUNNER_TEMP/libggml-opencl.so"
+          readelf -d "$RUNNER_TEMP/libggml-opencl.so" | tee "$RUNNER_TEMP/ggml-opencl.dynamic.txt"
+          grep -q 'Shared library: \[libOpenCL.so\]' "$RUNNER_TEMP/ggml-opencl.dynamic.txt"
+          if grep -q 'libOpenCLLoader.so' "$RUNNER_TEMP/ggml-opencl.dynamic.txt"; then
+            echo "ERROR: stale libOpenCLLoader dependency remains"
+            exit 1
+          fi
 
       - name: Collect APK
         run: |
