@@ -28,39 +28,42 @@ jobs:
           path = Path("app/src/main/java/com/qwen/tts/android/MainActivity.kt")
           text = path.read_text(encoding="utf-8")
 
-          old = '''private val backendOptions = listOf(
+          def replace_once(old, new, label):
+              global text
+              if old not in text:
+                  raise SystemExit(f"{label} not found")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              '''private val backendOptions = listOf(
               BackendOption("cpu", "CPU", QwenEngine.BACKEND_CPU),
           )
 
-          private val defaultBackendOption = backendOptions.first { it.id == "cpu" }'''
-          new = '''private val backendOptions = listOf(
+          private val defaultBackendOption = backendOptions.first { it.id == "cpu" }''',
+              '''private val backendOptions = listOf(
               BackendOption("auto", "AUTO / Vulkan", QwenEngine.BACKEND_AUTO),
               BackendOption("cpu", "CPU", QwenEngine.BACKEND_CPU),
           )
 
-          private val defaultBackendOption = backendOptions.first { it.id == "auto" }'''
-          if old not in text:
-              raise SystemExit("backend options block not found")
-          text = text.replace(old, new, 1)
+          private val defaultBackendOption = backendOptions.first { it.id == "auto" }''',
+              "backend options block",
+          )
 
-          old = '''    private val dao = QwenDatabase.getDatabase(application).qwenDao()
+          replace_once(
+              '''    private val dao = QwenDatabase.getDatabase(application).qwenDao()
               private val recorder = VoiceRecorder()
-          '''
-          new = '''    private val dao = QwenDatabase.getDatabase(application).qwenDao()
+          ''',
+              '''    private val dao = QwenDatabase.getDatabase(application).qwenDao()
               private val recorder = VoiceRecorder()
               private val runtimePrefs = application.getSharedPreferences("qwen_runtime_backend", 0)
-          '''
-          if old not in text:
-              raise SystemExit("viewmodel fields anchor not found")
-          text = text.replace(old, new, 1)
+          ''',
+              "runtime prefs anchor",
+          )
 
-          old = '''    init {
-              val threads = preferredCpuThreadCount()
-              _uiState.update { it.copy(selectedCpuThreads = threads, cpuThreads = threads) }
-              refreshModelState()
-          }
-          '''
-          new = '''    init {
+          vm_start = text.index("class MainViewModel(application: Application)")
+          init_start = text.index("    init {", vm_start)
+          init_end = text.index("\n    fun updateText", init_start)
+          new_init = '''    init {
               val threads = preferredCpuThreadCount()
               val previousAutoAttemptCrashed = runtimePrefs.getBoolean("auto_attempt_in_progress", false)
               val savedBackendId = runtimePrefs.getString("backend_id", defaultBackendOption.id)
@@ -92,114 +95,92 @@ jobs:
               }
               refreshModelState()
           }
-          '''
-          if old not in text:
-              raise SystemExit("init block not found")
-          text = text.replace(old, new, 1)
+          '''.rstrip()
+          text = text[:init_start] + new_init + text[init_end:]
 
-          anchor = '''    fun updateCpuThreads(value: Int) {
+          update_backend = '''    fun updateBackend(backendId: String) {
               if (_uiState.value.busy) return
-              _uiState.update { it.copy(selectedCpuThreads = value, cpuThreads = value) }
-              engine?.setCpuThreads(value)
-          }
-          '''
-          replacement = anchor + '''
-              fun updateBackend(backendId: String) {
-                  if (_uiState.value.busy) return
-                  val option = backendOptionById(backendId)
-                  if (_uiState.value.selectedBackendId == option.id) return
+              val option = backendOptionById(backendId)
+              if (_uiState.value.selectedBackendId == option.id) return
 
-                  stopAudio()
-                  engine?.close()
-                  engine = null
-                  generatedAudio = null
-                  runtimePrefs.edit()
-                      .putString("backend_id", option.id)
-                      .putBoolean("auto_attempt_in_progress", false)
-                      .commit()
+              stopAudio()
+              engine?.close()
+              engine = null
+              generatedAudio = null
+              runtimePrefs.edit()
+                  .putString("backend_id", option.id)
+                  .putBoolean("auto_attempt_in_progress", false)
+                  .commit()
 
-                  _uiState.update {
-                      it.copy(
-                          selectedBackendId = option.id,
-                          activeBackendName = null,
-                          loaded = false,
-                          status = if (it.modelReady) "Backend changed — model will reload on next generation" else it.status,
-                          sampleRate = 0,
-                          sampleCount = 0,
-                          synthesisMillis = 0,
-                          error = null,
-                          snackbarMessage = if (option.id == "auto") {
-                              "AUTO/Vulkan enabled. If the GPU path crashes, the next launch will use CPU safe mode."
-                          } else {
-                              "CPU safe mode enabled."
-                          },
-                      )
-                  }
+              _uiState.update {
+                  it.copy(
+                      selectedBackendId = option.id,
+                      activeBackendName = null,
+                      loaded = false,
+                      status = if (it.modelReady) "Backend changed — model will reload on next generation" else it.status,
+                      sampleRate = 0,
+                      sampleCount = 0,
+                      synthesisMillis = 0,
+                      error = null,
+                      snackbarMessage = if (option.id == "auto") {
+                          "AUTO/Vulkan enabled. If the GPU path crashes, the next launch will use CPU safe mode."
+                      } else {
+                          "CPU safe mode enabled."
+                      },
+                  )
               }
-          '''
-          if anchor not in text:
-              raise SystemExit("updateCpuThreads anchor not found")
-          text = text.replace(anchor, replacement, 1)
+          }
 
-          old = '''                    try {
-                          native.synthesize(
-                              text = text,
-                              speakerEmbeddingPath = selectedVoice?.speakerEmbeddingPath,
-                              params = QwenEngine.NativeParams(languageId = _uiState.value.selectedLanguageId),
-                          )
-                      } finally {
-                          _uiState.update {
-                              it.copy(activeBackendName = native.getActiveBackendName()?.takeIf { name -> name.isNotBlank() })
-                          }
-                          native.setProgressCallback(null)
-                      }
           '''
-          new = '''                    beginRiskyBackendAttempt()
-                      try {
-                          native.synthesize(
-                              text = text,
-                              speakerEmbeddingPath = selectedVoice?.speakerEmbeddingPath,
-                              params = QwenEngine.NativeParams(languageId = _uiState.value.selectedLanguageId),
-                          )
-                      } finally {
-                          finishRiskyBackendAttempt()
-                          _uiState.update {
-                              it.copy(activeBackendName = native.getActiveBackendName()?.takeIf { name -> name.isNotBlank() })
-                          }
-                          native.setProgressCallback(null)
-                      }
-          '''
-          if old not in text:
-              raise SystemExit("synthesis native block not found")
-          text = text.replace(old, new, 1)
+          language_anchor = "    fun updateLanguage(languageId: Int) {"
+          if "    fun updateBackend(backendId: String) {" not in text:
+              insert_at = text.index(language_anchor, vm_start)
+              text = text[:insert_at] + update_backend + text[insert_at:]
 
-          old = '''        if (!_uiState.value.loaded) {
+          synth_start = text.index("    fun synthesize() {", vm_start)
+          synth_end = text.index("\n    fun startVoiceRecording", synth_start)
+          synth = text[synth_start:synth_end]
+          replace_target = "                    try {\n                        native.synthesize("
+          if replace_target not in synth:
+              raise SystemExit("synthesis call anchor not found")
+          synth = synth.replace(
+              replace_target,
+              "                    beginRiskyBackendAttempt()\n                    try {\n                        native.synthesize(",
+              1,
+          )
+          finally_target = "                    } finally {\n                        _uiState.update {"
+          if finally_target not in synth:
+              raise SystemExit("synthesis finally anchor not found")
+          synth = synth.replace(
+              finally_target,
+              "                    } finally {\n                        finishRiskyBackendAttempt()\n                        _uiState.update {",
+              1,
+          )
+          text = text[:synth_start] + synth + text[synth_end:]
+
+          ensure_start = text.index("    private fun ensureEngineLoaded", vm_start)
+          ensure_end = text.index("\n    private fun preferredCpuThreadCount", ensure_start)
+          ensure = text[ensure_start:ensure_end]
+          load_start = ensure.index("        if (!_uiState.value.loaded) {")
+          caps_at = ensure.index("            val caps = native.getModelCapabilities()", load_start)
+          old_prefix = ensure[load_start:caps_at]
+          new_prefix = '''        if (!_uiState.value.loaded) {
+              beginRiskyBackendAttempt()
+              try {
                   if (!native.loadModels(modelDir.absolutePath, variant.talkerName)) {
                       error(native.getLastError() ?: "Native model load failed")
                   }
-                  val caps = native.getModelCapabilities()
+              } finally {
+                  finishRiskyBackendAttempt()
+              }
           '''
-          new = '''        if (!_uiState.value.loaded) {
-                  beginRiskyBackendAttempt()
-                  try {
-                      if (!native.loadModels(modelDir.absolutePath, variant.talkerName)) {
-                          error(native.getLastError() ?: "Native model load failed")
-                      }
-                  } finally {
-                      finishRiskyBackendAttempt()
-                  }
-                  val caps = native.getModelCapabilities()
-          '''
-          if old not in text:
-              raise SystemExit("model load block not found")
-          text = text.replace(old, new, 1)
+          ensure = ensure[:load_start] + new_prefix + ensure[caps_at:]
+          text = text[:ensure_start] + ensure + text[ensure_end:]
 
-          anchor = '''    private fun preferredCpuThreadCount(): Int {
-          '''
+          helper_anchor = "    private fun preferredCpuThreadCount(): Int {"
           helpers = '''    private fun beginRiskyBackendAttempt() {
               if (selectedBackendOption().id == "auto") {
-                  // commit() is intentional: if native Vulkan terminates the process,
-                  // the next launch can detect that the attempt never completed.
+                  // commit() is intentional: a native Vulkan crash will leave this flag set.
                   runtimePrefs.edit().putBoolean("auto_attempt_in_progress", true).commit()
               }
           }
@@ -210,25 +191,23 @@ jobs:
                   }
               }
 
-          ''' + anchor
-          if anchor not in text:
-              raise SystemExit("preferredCpuThreadCount anchor not found")
-          text = text.replace(anchor, helpers, 1)
+          '''
+          if "    private fun beginRiskyBackendAttempt() {" not in text:
+              helper_at = text.index(helper_anchor, vm_start)
+              text = text[:helper_at] + helpers + text[helper_at:]
 
-          old = '''        RuntimePanel(
+          replace_once(
+              '''        RuntimePanel(
                   state = state,
                   onCpuThreadsChange = viewModel::updateCpuThreads,
-              )
-          '''
-          new = '''        RuntimePanel(
+              )''',
+              '''        RuntimePanel(
                   state = state,
                   onBackendChange = viewModel::updateBackend,
                   onCpuThreadsChange = viewModel::updateCpuThreads,
-              )
-          '''
-          if old not in text:
-              raise SystemExit("RuntimePanel call not found")
-          text = text.replace(old, new, 1)
+              )''',
+              "RuntimePanel call",
+          )
 
           runtime_start = text.index("@Composable\nprivate fun RuntimePanel(")
           runtime_end = text.index("\n@Composable\nprivate fun ResultPanel", runtime_start)
