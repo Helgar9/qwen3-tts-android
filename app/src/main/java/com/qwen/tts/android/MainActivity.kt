@@ -1580,15 +1580,64 @@ private fun RuntimePanel(
     state: QwenTtsUiState,
     onCpuThreadsChange: (Int) -> Unit,
 ) {
+    val activeBackend = state.activeBackendName?.trim()?.takeIf { it.isNotEmpty() }
+    val cpuActive = activeBackend?.contains("cpu", ignoreCase = true) == true
+    val gpuStatus = when {
+        activeBackend == null -> "Not initialized"
+        cpuActive -> "OFF — CPU is active"
+        else -> "ON — non-CPU backend is active"
+    }
+    val gpuStatusColor = when {
+        activeBackend == null -> MaterialTheme.colorScheme.onSurfaceVariant
+        cpuActive -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.primary
+    }
+
     ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Icon(Icons.Default.Tune, contentDescription = null)
-                Text("Performance", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text("Performance & backend diagnostics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             }
+
             Text(
-                "CPU backend",
+                "Configured preference: CPU (forced by the current Android UI)",
                 style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "Active native backend: ${activeBackend ?: "Not initialized — load the model or generate once"}",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                "GPU / Vulkan acceleration: $gpuStatus",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = gpuStatusColor,
+            )
+
+            when {
+                activeBackend == null -> Text(
+                    "The runtime backend is reported after the native model initializes.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                cpuActive -> Text(
+                    "Inference is currently running on the CPU. A Vulkan-capable APK can still show this when the app selects CPU before model loading.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                else -> Text(
+                    "A non-CPU backend is active. In the S23 Vulkan performance build, this indicates the GPU path was selected.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+
+            Text(
+                "CPU threads: ${state.cpuThreads.coerceAtLeast(state.selectedCpuThreads)}",
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1604,7 +1653,6 @@ private fun RuntimePanel(
         }
     }
 }
-
 @Composable
 private fun ResultPanel(state: QwenTtsUiState, onPlay: () -> Unit, onStop: () -> Unit) {
     ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
@@ -1646,8 +1694,19 @@ private fun GenerationStats(state: QwenTtsUiState) {
     val remainingMillis = state.estimatedSynthesisMillis
         ?.minus(state.operationElapsedMillis)
         ?.coerceAtLeast(0L)
+    val activeBackend = state.activeBackendName?.trim()?.takeIf { it.isNotEmpty() }
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            "Backend: ${activeBackend ?: "initializing..."}",
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Medium,
+            color = if (activeBackend?.contains("cpu", ignoreCase = true) == true) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
         Text(
             "Elapsed ${formatDuration(state.operationElapsedMillis)}",
             style = MaterialTheme.typography.bodySmall,
@@ -1669,7 +1728,6 @@ private fun GenerationStats(state: QwenTtsUiState) {
         }
     }
 }
-
 private data class WavData(val samples: FloatArray, val sampleRate: Int)
 
 private fun readWav(path: String): WavData {
