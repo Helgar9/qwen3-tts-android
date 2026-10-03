@@ -1,0 +1,169 @@
+name: Add backend diagnostics source patch
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/add-backend-diagnostics.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add visible backend diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("app/src/main/java/com/qwen/tts/android/MainActivity.kt")
+          text = path.read_text(encoding="utf-8")
+
+          runtime_start = text.index("@Composable\nprivate fun RuntimePanel(")
+          runtime_end = text.index("\n@Composable\nprivate fun ResultPanel", runtime_start)
+          runtime_panel = r'''@Composable
+          private fun RuntimePanel(
+              state: QwenTtsUiState,
+              onCpuThreadsChange: (Int) -> Unit,
+          ) {
+              val activeBackend = state.activeBackendName?.trim()?.takeIf { it.isNotEmpty() }
+              val cpuActive = activeBackend?.contains("cpu", ignoreCase = true) == true
+              val gpuStatus = when {
+                  activeBackend == null -> "Not initialized"
+                  cpuActive -> "OFF — CPU is active"
+                  else -> "ON — non-CPU backend is active"
+              }
+              val gpuStatusColor = when {
+                  activeBackend == null -> MaterialTheme.colorScheme.onSurfaceVariant
+                  cpuActive -> MaterialTheme.colorScheme.error
+                  else -> MaterialTheme.colorScheme.primary
+              }
+
+              ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                  Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                      Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                          Icon(Icons.Default.Tune, contentDescription = null)
+                          Text("Performance & backend diagnostics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                      }
+
+                      Text(
+                          "Configured preference: CPU (forced by the current Android UI)",
+                          style = MaterialTheme.typography.bodyMedium,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                      Text(
+                          "Active native backend: ${activeBackend ?: "Not initialized — load the model or generate once"}",
+                          style = MaterialTheme.typography.bodyMedium,
+                          fontWeight = FontWeight.Medium,
+                      )
+                      Text(
+                          "GPU / Vulkan acceleration: $gpuStatus",
+                          style = MaterialTheme.typography.bodyMedium,
+                          fontWeight = FontWeight.SemiBold,
+                          color = gpuStatusColor,
+                      )
+
+                      when {
+                          activeBackend == null -> Text(
+                              "The runtime backend is reported after the native model initializes.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                          cpuActive -> Text(
+                              "Inference is currently running on the CPU. A Vulkan-capable APK can still show this when the app selects CPU before model loading.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.error,
+                          )
+                          else -> Text(
+                              "A non-CPU backend is active. In the S23 Vulkan performance build, this indicates the GPU path was selected.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.primary,
+                          )
+                      }
+
+                      Text(
+                          "CPU threads: ${state.cpuThreads.coerceAtLeast(state.selectedCpuThreads)}",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          listOf(4, 6).forEach { threads ->
+                              FilterChip(
+                                  selected = state.selectedCpuThreads == threads,
+                                  onClick = { onCpuThreadsChange(threads) },
+                                  enabled = !state.busy,
+                                  label = { Text("$threads threads") },
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+          '''.strip()
+          text = text[:runtime_start] + runtime_panel + text[runtime_end:]
+
+          stats_start = text.index("@Composable\nprivate fun GenerationStats(")
+          stats_end = text.index("\nprivate data class WavData", stats_start)
+          generation_stats = r'''@Composable
+          private fun GenerationStats(state: QwenTtsUiState) {
+              val generatedAudioSeconds = state.synthesisFrames * 0.08
+              val remainingMillis = state.estimatedSynthesisMillis
+                  ?.minus(state.operationElapsedMillis)
+                  ?.coerceAtLeast(0L)
+              val activeBackend = state.activeBackendName?.trim()?.takeIf { it.isNotEmpty() }
+
+              Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                  Text(
+                      "Backend: ${activeBackend ?: "initializing..."}",
+                      style = MaterialTheme.typography.bodySmall,
+                      fontWeight = FontWeight.Medium,
+                      color = if (activeBackend?.contains("cpu", ignoreCase = true) == true) {
+                          MaterialTheme.colorScheme.error
+                      } else {
+                          MaterialTheme.colorScheme.onSurfaceVariant
+                      },
+                  )
+                  Text(
+                      "Elapsed ${formatDuration(state.operationElapsedMillis)}",
+                      style = MaterialTheme.typography.bodySmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                  if (state.synthesisFrames > 0) {
+                      Text(
+                          "Audio so far ~${formatSeconds(generatedAudioSeconds)}",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+                  if (remainingMillis != null && state.estimateSampleCount >= 3) {
+                      Text(
+                          "Estimated remaining ${formatDuration(remainingMillis)}",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+              }
+          }
+          '''.strip()
+          text = text[:stats_start] + generation_stats + text[stats_end:]
+
+          path.write_text(text + ("" if text.endswith("\n") else "\n"), encoding="utf-8")
+          PY
+
+      - name: Commit diagnostics UI
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/qwen/tts/android/MainActivity.kt
+          git diff --cached --check
+          git commit -m "Show active CPU or GPU backend in Android UI"
+          git push origin HEAD:main
