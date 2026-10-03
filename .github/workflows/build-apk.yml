@@ -1,4 +1,4 @@
-name: Build S23 Performance APK
+name: Build S23 OpenCL Performance APK
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build S23 Performance Release APK
+    name: Build S23 OpenCL Release APK
     runs-on: ubuntu-latest
 
     steps:
@@ -42,25 +42,92 @@ jobs:
             "ndk;27.2.12479018" \
             "cmake;3.22.1"
 
-      - name: Install Vulkan build dependencies
+      - name: Install host build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y glslc libvulkan-dev git
+          sudo apt-get install -y git ninja-build patchelf
 
-          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git "$RUNNER_TEMP/SPIRV-Headers"
+      - name: Build Android OpenCL loader
+        shell: bash
+        run: |
+          set -euxo pipefail
+          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          SDK="$RUNNER_TEMP/qwen-opencl-sdk"
+
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers.git "$RUNNER_TEMP/OpenCL-Headers"
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader.git "$RUNNER_TEMP/OpenCL-ICD-Loader"
+
           cmake \
-            -S "$RUNNER_TEMP/SPIRV-Headers" \
-            -B "$RUNNER_TEMP/SPIRV-Headers-build" \
-            -DSPIRV_HEADERS_ENABLE_TESTS=OFF \
-            -DSPIRV_HEADERS_ENABLE_INSTALL=ON \
-            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/spirv-install"
-          cmake --build "$RUNNER_TEMP/SPIRV-Headers-build"
-          cmake --install "$RUNNER_TEMP/SPIRV-Headers-build"
+            -S "$RUNNER_TEMP/OpenCL-ICD-Loader" \
+            -B "$RUNNER_TEMP/OpenCL-ICD-Loader-build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="$RUNNER_TEMP/OpenCL-Headers" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=31 \
+            -DANDROID_STL=c++_shared \
+            -DENABLE_OPENCL_LAYERS=OFF
+          cmake --build "$RUNNER_TEMP/OpenCL-ICD-Loader-build"
 
-          test -f "$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
+          LOADER="$(find "$RUNNER_TEMP/OpenCL-ICD-Loader-build" -name libOpenCL.so -type f | head -n 1)"
+          test -n "$LOADER"
 
-          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/Vulkan-Headers"
-          test -f "$RUNNER_TEMP/Vulkan-Headers/include/vulkan/vulkan.hpp"
+          mkdir -p "$SDK/OpenCL-Headers" "$SDK/lib/arm64-v8a" app/src/main/jniLibs/arm64-v8a
+          cp -R "$RUNNER_TEMP/OpenCL-Headers/CL" "$SDK/OpenCL-Headers/"
+
+          # Give the bundled ICD loader a unique SONAME. This lets it dynamically
+          # open Samsung/Qualcomm's real system libOpenCL.so instead of loading itself.
+          cp "$LOADER" "$SDK/lib/arm64-v8a/libOpenCL.so"
+          patchelf --set-soname libOpenCLLoader.so "$SDK/lib/arm64-v8a/libOpenCL.so"
+          cp "$SDK/lib/arm64-v8a/libOpenCL.so" app/src/main/jniLibs/arm64-v8a/libOpenCLLoader.so
+
+          readelf -d app/src/main/jniLibs/arm64-v8a/libOpenCLLoader.so | grep SONAME
+          ls -lh app/src/main/jniLibs/arm64-v8a "$SDK/lib/arm64-v8a"
+
+      - name: Configure OpenCL runtime discovery
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # The Khronos loader supports OCL_ICD_FILENAMES. Set it before ggml's
+          # first OpenCL call so it can reach the Qualcomm/Samsung vendor driver.
+          jni = Path("external/qwen3-tts.cpp/src/qwen3_tts_jni.cpp")
+          text = jni.read_text(encoding="utf-8")
+          if "#include <cstdlib>" not in text:
+              text = text.replace("#include <cstring>\n", "#include <cstring>\n#include <cstdlib>\n", 1)
+          anchor = '''JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+          '''
+          injection = '''JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+              // Android vendor OpenCL driver discovery. The bundled ICD loader is
+              // named libOpenCLLoader.so, so libOpenCL.so resolves to the device driver.
+              setenv("OCL_ICD_FILENAMES",
+                     "libOpenCL.so:/vendor/lib64/libOpenCL.so:/system/vendor/lib64/libOpenCL.so",
+                     0);
+          '''
+          if anchor not in text:
+              raise SystemExit("JNI_OnLoad anchor not found")
+          text = text.replace(anchor, injection, 1)
+          jni.write_text(text, encoding="utf-8")
+
+          # This APK is OpenCL, not Vulkan. Keep the existing AUTO/CPU safety UI,
+          # but make its labels and diagnostics accurate for this build.
+          ui = Path("app/src/main/java/com/qwen/tts/android/MainActivity.kt")
+          text = ui.read_text(encoding="utf-8")
+          replacements = {
+              'BackendOption("auto", "AUTO / Vulkan", QwenEngine.BACKEND_AUTO)':
+                  'BackendOption("auto", "AUTO / OpenCL", QwenEngine.BACKEND_AUTO)',
+              "GPU / Vulkan acceleration": "GPU / OpenCL acceleration",
+              "GPU/Vulkan": "GPU/OpenCL",
+              "Vulkan did not become the active backend.": "OpenCL did not become the active backend.",
+              "Switch to AUTO / Vulkan": "Switch to AUTO / OpenCL",
+              "native Vulkan crashes": "native OpenCL crashes",
+          }
+          for old, new in replacements.items():
+              text = text.replace(old, new)
+          ui.write_text(text, encoding="utf-8")
+          PY
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -68,25 +135,29 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x ./gradlew
 
-      - name: Build S23 optimized release APK
+      - name: Build S23 OpenCL optimized release APK
         run: |
           ./gradlew :app:assembleRelease \
-            -Pqwen.vulkan=true \
+            -Pqwen.vulkan=false \
+            -Pqwen.opencl=true \
             -Pqwen.openmp=true \
-            -Pqwen.spirvHeadersDir="$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers" \
-            -Pqwen.vulkanHeadersDir="$RUNNER_TEMP/Vulkan-Headers/include" \
+            -Pqwen.opencl.sdkDir="$RUNNER_TEMP/qwen-opencl-sdk" \
             --stacktrace
+
+      - name: Inspect packaged native libraries
+        run: |
+          unzip -l app/build/outputs/apk/release/app-release.apk | grep -E 'lib/(arm64-v8a|arm64)/.*(OpenCL|qwen|ggml)' || true
 
       - name: Collect APK
         run: |
           mkdir -p artifacts
           cp app/build/outputs/apk/release/app-release.apk \
-            artifacts/qwen3-tts-s23-vulkan-openmp-release.apk
+            artifacts/qwen3-tts-s23-opencl-adreno-release.apk
           ls -lh artifacts
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: qwen3-tts-s23-performance
-          path: artifacts/qwen3-tts-s23-vulkan-openmp-release.apk
+          name: qwen3-tts-s23-opencl-adreno
+          path: artifacts/qwen3-tts-s23-opencl-adreno-release.apk
           if-no-files-found: error
