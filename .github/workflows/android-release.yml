@@ -1,4 +1,4 @@
-name: Android Release
+name: Android S23 Release
 
 on:
   push:
@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, for example 0.1.0. Defaults to the tag name without v."
+        description: "Release version, for example 0.1.0. Defaults to an automatic version."
         required: false
         type: string
       prerelease:
         description: "Mark the GitHub release as a prerelease."
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   build-android:
-    name: Build Android APK
+    name: Build S23 Vulkan APK
     runs-on: ubuntu-latest
 
     steps:
@@ -55,7 +55,7 @@ jobs:
           java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android build tools
         run: |
@@ -65,38 +65,70 @@ jobs:
             "ndk;27.2.12479018" \
             "cmake;3.22.1"
 
+      - name: Install Vulkan build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc libvulkan-dev git
+
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git "$RUNNER_TEMP/SPIRV-Headers"
+          cmake \
+            -S "$RUNNER_TEMP/SPIRV-Headers" \
+            -B "$RUNNER_TEMP/SPIRV-Headers-build" \
+            -DSPIRV_HEADERS_ENABLE_TESTS=OFF \
+            -DSPIRV_HEADERS_ENABLE_INSTALL=ON \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/spirv-install"
+          cmake --build "$RUNNER_TEMP/SPIRV-Headers-build"
+          cmake --install "$RUNNER_TEMP/SPIRV-Headers-build"
+
+          test -f "$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
+
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/Vulkan-Headers"
+          test -f "$RUNNER_TEMP/Vulkan-Headers/include/vulkan/vulkan.hpp"
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build release APK
+      - name: Build S23 performance release APK
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleRelease
+          ./gradlew :app:assembleRelease \
+            -Pqwen.vulkan=true \
+            -Pqwen.openmp=true \
+            -Pqwen.spirvHeadersDir="$RUNNER_TEMP/spirv-install/share/cmake/SPIRV-Headers" \
+            -Pqwen.vulkanHeadersDir="$RUNNER_TEMP/Vulkan-Headers/include" \
+            --stacktrace
 
       - name: Collect APK
         run: |
           mkdir -p artifacts
           cp app/build/outputs/apk/release/app-release.apk \
-            "artifacts/qwen3-tts-android-${RELEASE_VERSION}-arm64-v8a.apk"
+            "artifacts/qwen3-tts-s23-${RELEASE_VERSION}-vulkan-openmp.apk"
           ls -lh artifacts
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qwen3-tts-android-${{ env.RELEASE_VERSION }}
+          name: qwen3-tts-s23-${{ env.RELEASE_VERSION }}
           path: artifacts/*.apk
+          if-no-files-found: error
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.RELEASE_VERSION }}
           target_commitish: ${{ github.sha }}
-          name: Qwen3 TTS Android ${{ env.RELEASE_VERSION }}
+          name: Qwen3 TTS Android S23 ${{ env.RELEASE_VERSION }}
           body: |
-            Android APK:
+            Galaxy S23 performance build.
 
-            - `qwen3-tts-android-${{ env.RELEASE_VERSION }}-arm64-v8a.apk`
+            Build configuration:
+            - arm64-v8a
+            - Vulkan enabled at build time
+            - OpenMP enabled
 
-            The APK is the Android release build for arm64 devices.
+            APK:
+            - `qwen3-tts-s23-${{ env.RELEASE_VERSION }}-vulkan-openmp.apk`
+
+            Note: Vulkan being included in the APK does not guarantee that runtime GPU offload succeeds on every device/driver. The app may still fall back to CPU while the Android Vulkan backend issue is being investigated.
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
           files: artifacts/*.apk
