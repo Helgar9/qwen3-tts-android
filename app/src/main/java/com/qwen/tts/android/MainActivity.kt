@@ -148,10 +148,11 @@ private val languageOptions = listOf(
 )
 
 private val backendOptions = listOf(
+    BackendOption("auto", "AUTO / Vulkan", QwenEngine.BACKEND_AUTO),
     BackendOption("cpu", "CPU", QwenEngine.BACKEND_CPU),
 )
 
-private val defaultBackendOption = backendOptions.first { it.id == "cpu" }
+private val defaultBackendOption = backendOptions.first { it.id == "auto" }
 
 private object QwenModel {
     private const val repo = "Serveurperso/Qwen3-TTS-GGUF"
@@ -251,6 +252,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val generationDir = File(application.filesDir, "generations")
     private val dao = QwenDatabase.getDatabase(application).qwenDao()
     private val recorder = VoiceRecorder()
+    private val runtimePrefs = application.getSharedPreferences("qwen_runtime_backend", 0)
 
     val voices = dao.observeVoices().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     val generations = dao.observeGenerations().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -271,11 +273,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var activeTrack: AudioTrack? = null
 
     init {
-        val threads = preferredCpuThreadCount()
-        _uiState.update { it.copy(selectedCpuThreads = threads, cpuThreads = threads) }
-        refreshModelState()
+    val threads = preferredCpuThreadCount()
+    val previousAutoAttemptCrashed = runtimePrefs.getBoolean("auto_attempt_in_progress", false)
+    val savedBackendId = runtimePrefs.getString("backend_id", defaultBackendOption.id) ?: defaultBackendOption.id
+    val initialBackendId = if (previousAutoAttemptCrashed) "cpu" else backendOptionById(savedBackendId).id
+
+    if (previousAutoAttemptCrashed) {
+        runtimePrefs.edit()
+            .putString("backend_id", "cpu")
+            .putBoolean("auto_attempt_in_progress", false)
+            .commit()
     }
 
+    _uiState.update {
+        it.copy(
+            selectedCpuThreads = threads,
+            cpuThreads = threads,
+            selectedBackendId = initialBackendId,
+            snackbarMessage = if (previousAutoAttemptCrashed) {
+                "Previous GPU/Vulkan attempt ended unexpectedly. Started in CPU safe mode."
+            } else null,
+        )
+    }
+    refreshModelState()
+}
     fun updateText(value: String) {
         _uiState.update { it.copy(text = value) }
     }
@@ -285,6 +306,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(selectedCpuThreads = value, cpuThreads = value) }
         engine?.setCpuThreads(value)
     }
+
+    fun updateBackend(backendId: String) {
+    if (_uiState.value.busy) return
+    val option = backendOptionById(backendId)
+    if (_uiState.value.selectedBackendId == option.id) return
+
+    stopAudio()
+    engine?.close()
+    engine = null
+    generatedAudio = null
+    runtimePrefs.edit()
+        .putString("backend_id", option.id)
+        .putBoolean("auto_attempt_in_progress", false)
+        .commit()
+    _uiState.update {
+        it.copy(
+            selectedBackendId = option.id,
+            activeBackendName = null,
+            loaded = false,
+            status = if (it.modelReady) "Backend changed — model will reload on next generation" else it.status,
+            sampleRate = 0,
+            sampleCount = 0,
+            synthesisMillis = 0,
+            error = null,
+            snackbarMessage = if (option.id == "auto") {
+                "AUTO/Vulkan enabled. If the GPU path crashes, the next launch will use CPU safe mode."
+            } else {
+                "CPU safe mode enabled."
+            },
+        )
+    }
+}
 
     fun updateLanguage(languageId: Int) {
         if (_uiState.value.busy) return
@@ -438,6 +491,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             )
                         }
                     }
+                    beginRiskyBackendAttempt()
                     try {
                         native.synthesize(
                             text = text,
@@ -445,6 +499,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             params = QwenEngine.NativeParams(languageId = _uiState.value.selectedLanguageId),
                         )
                     } finally {
+                        finishRiskyBackendAttempt()
                         _uiState.update {
                             it.copy(activeBackendName = native.getActiveBackendName()?.takeIf { name -> name.isNotBlank() })
                         }
@@ -719,9 +774,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val threads = selectedCpuThreadCount()
         native.setCpuThreads(threads)
         if (!_uiState.value.loaded) {
-            if (!native.loadModels(modelDir.absolutePath, variant.talkerName)) {
-                error(native.getLastError() ?: "Native model load failed")
-            }
+    beginRiskyBackendAttempt()
+    try {
+        if (!native.loadModels(modelDir.absolutePath, variant.talkerName)) {
+            error(native.getLastError() ?: "Native model load failed")
+        }
+    } finally {
+        finishRiskyBackendAttempt()
+    }
             val caps = native.getModelCapabilities()
             _uiState.update {
                 it.copy(
@@ -734,6 +794,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         return native
+    }
+
+    private fun beginRiskyBackendAttempt() {
+    if (selectedBackendOption().id == "auto") {
+        runtimePrefs.edit().putBoolean("auto_attempt_in_progress", true).commit()
+    }
+}
+
+    private fun finishRiskyBackendAttempt() {
+        if (runtimePrefs.getBoolean("auto_attempt_in_progress", false)) {
+            runtimePrefs.edit().putBoolean("auto_attempt_in_progress", false).commit()
+        }
     }
 
     private fun preferredCpuThreadCount(): Int {
@@ -1364,6 +1436,7 @@ private fun SettingsScreen(viewModel: MainViewModel) {
         )
         RuntimePanel(
             state = state,
+            onBackendChange = viewModel::updateBackend,
             onCpuThreadsChange = viewModel::updateCpuThreads,
         )
     }
@@ -1578,19 +1651,23 @@ private fun ModelPanel(
 @Composable
 private fun RuntimePanel(
     state: QwenTtsUiState,
+    onBackendChange: (String) -> Unit,
     onCpuThreadsChange: (Int) -> Unit,
 ) {
+    val selectedBackend = backendOptionById(state.selectedBackendId)
     val activeBackend = state.activeBackendName?.trim()?.takeIf { it.isNotEmpty() }
     val cpuActive = activeBackend?.contains("cpu", ignoreCase = true) == true
+    val autoMode = selectedBackend.id == "auto"
     val gpuStatus = when {
-        activeBackend == null -> "Not initialized"
-        cpuActive -> "OFF — CPU is active"
-        else -> "ON — non-CPU backend is active"
+        !autoMode -> "OFF — CPU safe mode selected"
+        activeBackend == null -> "Waiting for model initialization"
+        cpuActive -> "OFF — AUTO fell back to CPU"
+        else -> "ON — GPU/Vulkan backend is active"
     }
     val gpuStatusColor = when {
-        activeBackend == null -> MaterialTheme.colorScheme.onSurfaceVariant
-        cpuActive -> MaterialTheme.colorScheme.error
-        else -> MaterialTheme.colorScheme.primary
+        autoMode && activeBackend != null && !cpuActive -> MaterialTheme.colorScheme.primary
+        autoMode && activeBackend == null -> MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.error
     }
 
     ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
@@ -1599,42 +1676,49 @@ private fun RuntimePanel(
                 Icon(Icons.Default.Tune, contentDescription = null)
                 Text("Performance & backend diagnostics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             }
-
-            Text(
-                "Configured preference: CPU (forced by the current Android UI)",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Text("Backend mode", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                backendOptions.forEach { option ->
+                    FilterChip(
+                        selected = state.selectedBackendId == option.id,
+                        onClick = { onBackendChange(option.id) },
+                        enabled = !state.busy,
+                        label = { Text(option.label) },
+                    )
+                }
+            }
+            Text("Configured preference: ${selectedBackend.label}", color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text(
                 "Active native backend: ${activeBackend ?: "Not initialized — load the model or generate once"}",
-                style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.Medium,
             )
             Text(
                 "GPU / Vulkan acceleration: $gpuStatus",
-                style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = gpuStatusColor,
             )
-
             when {
+                !autoMode -> Text(
+                    "CPU safe mode bypasses GPU selection. Switch to AUTO / Vulkan to test the S23 GPU path.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 activeBackend == null -> Text(
-                    "The runtime backend is reported after the native model initializes.",
+                    "AUTO tries accelerated backends first and falls back to CPU. If native Vulkan crashes the app, the next launch automatically starts in CPU safe mode.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 cpuActive -> Text(
-                    "Inference is currently running on the CPU. A Vulkan-capable APK can still show this when the app selects CPU before model loading.",
+                    "AUTO is selected, but inference is running on CPU. Vulkan did not become the active backend.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
                 else -> Text(
-                    "A non-CPU backend is active. In the S23 Vulkan performance build, this indicates the GPU path was selected.",
+                    "GPU acceleration is active. Compare generation time with CPU mode using the same text and voice.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary,
                 )
             }
-
             Text(
                 "CPU threads: ${state.cpuThreads.coerceAtLeast(state.selectedCpuThreads)}",
                 style = MaterialTheme.typography.bodySmall,
@@ -1645,7 +1729,7 @@ private fun RuntimePanel(
                     FilterChip(
                         selected = state.selectedCpuThreads == threads,
                         onClick = { onCpuThreadsChange(threads) },
-                        enabled = !state.busy,
+                        enabled = !state.busy && state.selectedBackendId == "cpu",
                         label = { Text("$threads threads") },
                     )
                 }
